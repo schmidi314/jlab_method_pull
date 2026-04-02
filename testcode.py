@@ -6,7 +6,7 @@ _x = 3
 y = 77
 
 def testfunc(a):
-    print(a)
+    print(a, 'test')
 
 
 class OtherClass:
@@ -15,6 +15,11 @@ class OtherClass:
 
 
 class Calculator:
+
+    @staticmethod
+    def testStatic(x):
+        print('static', x, 'b')
+        return x
 
     def calclog(self, x):
         """this is a docstring"""

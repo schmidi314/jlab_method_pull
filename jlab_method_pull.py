@@ -2,6 +2,7 @@ import ast
 import inspect
 import shutil
 import textwrap
+import types
 from pathlib import Path
 
 
@@ -85,37 +86,52 @@ def _resolve_conflicts(startup_dir: Path, skip: Path):
                 print("  Please enter d, x, or s.")
 
 
-def pullMethodCode(class_method) -> str:
-    """Open a new cell with the method's source, ready to edit and re-inject."""
+def pullMethodCode(func) -> str:
+    """Open a new cell with the function/method source, ready to edit and re-inject."""
     # Dedent so the def is at column 0
-    source = textwrap.dedent(inspect.getsource(class_method))
+    source = textwrap.dedent(inspect.getsource(func))
 
-    # Derive class name and module from the method
-    qualname_parts = class_method.__qualname__.split(".")
-    class_name = qualname_parts[-2] if len(qualname_parts) >= 2 else None
-    method_name = class_method.__name__
-    module = inspect.getmodule(class_method)
+    qualname_parts = func.__qualname__.split(".")
+    is_method = len(qualname_parts) >= 2 and "<locals>" not in qualname_parts
+    class_name = qualname_parts[-2] if is_method else None
+    func_name = func.__name__
+    module = inspect.getmodule(func)
     module_name = module.__name__ if module else None
 
-    source_file = inspect.getfile(class_method)
+    # Detect static method and strip @staticmethod decorator from cell source
+    # so the user edits a plain function (injectMethod re-applies the wrapper).
+    cls = getattr(module, class_name, None) if (module and class_name) else None
+    is_static = cls is not None and isinstance(cls.__dict__.get(func_name), staticmethod)
+    if is_static:
+        source = _strip_staticmethod_decorator(source)
+
+    source_file = inspect.getfile(func)
 
     # Collect top-level imports from the source file
     file_imports = _extract_file_imports(source_file)
 
-    # Import every public name defined at module level in the source file
+    # All public names defined in the source file (for from-import line)
     all_module_names = _all_module_level_names(source_file)
 
     # Build cell content
     lines = []
     if file_imports:
         lines.append(file_imports)
-    if module_name and all_module_names:
-        names_str = ", ".join(sorted(all_module_names))
-        lines.append(f"from {module_name} import {names_str}")
+    if module_name:
+        if is_method and all_module_names:
+            names_str = ", ".join(sorted(all_module_names))
+            lines.append(f"from {module_name} import {names_str}")
+        else:
+            # Module-level function: import the module itself so injectMethod can target it
+            lines.append(f"import {module_name}")
+            if all_module_names:
+                names_str = ", ".join(sorted(all_module_names))
+                lines.append(f"from {module_name} import {names_str}")
     lines.append("")
     lines.append(source.rstrip())
     lines.append("")
-    lines.append(f"injectMethod({method_name}, {class_name}, persistent=False)")
+    target = class_name if is_method else module_name
+    lines.append(f"injectMethod({func_name}, {target}, persistent=False)")
 
     cell_content = "\n".join(lines)
 
@@ -158,28 +174,34 @@ def _all_module_level_names(source_file: str) -> list[str]:
     return names
 
 
-def injectMethod(new_method_implementation, target_class, persistent=True):
-    """Inject a function as a method into target_class.
+def injectMethod(new_implementation, target, persistent=True):
+    """Inject a function as a method into a class, or replace a function in a module.
 
     Parameters
     ----------
-    new_method_implementation : callable
-        The function to inject. Its __name__ determines which method is
-        replaced or added.
-    target_class : type
-        The class to receive the method.
+    new_implementation : callable
+        The function to inject. Its __name__ determines what is replaced or added.
+    target : type or module
+        The class or module to inject into.
     persistent : bool
-        If True, also rewrites the class's source file so the change
-        survives the next import. If False, only monkey-patches in memory.
+        If True, also rewrites the target's source file so the change
+        survives the next import. If False, only patches in memory.
     """
-    method_name = new_method_implementation.__name__
+    func_name = new_implementation.__name__
+
+    is_static = (
+        not isinstance(target, types.ModuleType)
+        and isinstance(target.__dict__.get(func_name), staticmethod)
+    )
 
     if persistent:
-        _persist_method(new_method_implementation, target_class, method_name)
+        _persist_method(new_implementation, target, func_name, is_static=is_static)
 
-    setattr(target_class, method_name, new_method_implementation)
+    value = staticmethod(new_implementation) if is_static else new_implementation
+    setattr(target, func_name, value)
     location = "persistent" if persistent else "in-memory only"
-    print(f"Injected '{method_name}' into {target_class.__name__} ({location})")
+    target_name = target.__name__ if hasattr(target, "__name__") else str(target)
+    print(f"Injected '{func_name}' into {target_name} ({location})")
 
 
 # ---------------------------------------------------------------------------
@@ -212,44 +234,79 @@ def _class_body_indent(target_class, file_lines: list[str]) -> str:
     return "    "  # fall back to 4 spaces
 
 
-def _find_method_lines_in_file(source: str, class_name: str, method_name: str):
-    """Return (start_lineno, end_lineno) of a method inside a class using AST.
+def _find_func_lines_in_file(source: str, func_name: str, class_name: str | None = None):
+    """Return (start_lineno, end_lineno) of a function/method using AST.
 
-    Both values are 1-indexed; end_lineno is inclusive.
+    If class_name is given, searches inside that class; otherwise searches at
+    module level. start_lineno includes any leading decorators. Both line
+    numbers are 1-indexed; end_lineno is inclusive.
     Returns (None, None) if not found.
     """
     tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == class_name:
-            for item in node.body:
-                if (
-                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and item.name == method_name
-                ):
-                    return item.lineno, item.end_lineno
+
+    def _lines(item):
+        start = item.decorator_list[0].lineno if item.decorator_list else item.lineno
+        return start, item.end_lineno
+
+    if class_name is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for item in node.body:
+                    if (
+                        isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and item.name == func_name
+                    ):
+                        return _lines(item)
+    else:
+        for node in tree.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == func_name
+            ):
+                return _lines(node)
     return None, None
 
 
-def _persist_method(new_func, target_class, method_name: str):
-    source_file = inspect.getfile(target_class)
+def _strip_staticmethod_decorator(source: str) -> str:
+    """Remove the @staticmethod decorator line from a dedented function source."""
+    lines = source.splitlines(keepends=True)
+    return "".join(
+        line for line in lines
+        if line.strip() not in ("@staticmethod",)
+    )
+
+
+def _persist_method(new_func, target, func_name: str, is_static: bool = False):
+    source_file = inspect.getfile(target)
 
     with open(source_file, "r") as fh:
         content = fh.read()
     file_lines = content.splitlines(keepends=True)
 
-    class_indent = _class_body_indent(target_class, file_lines)
-    new_lines = _get_indented_source(new_func, class_indent)
+    is_module = isinstance(target, types.ModuleType)
+    class_name = None if is_module else target.__name__
 
-    start_lineno, end_lineno = _find_method_lines_in_file(
-        content, target_class.__name__, method_name
-    )
+    if is_module:
+        # Module-level function: no extra indentation
+        raw = textwrap.dedent(inspect.getsource(new_func))
+        if not raw.endswith("\n"):
+            raw += "\n"
+        new_lines = raw.splitlines(keepends=True)
+    else:
+        class_indent = _class_body_indent(target, file_lines)
+        new_lines = _get_indented_source(new_func, class_indent)
+        if is_static:
+            new_lines = [f"{class_indent}@staticmethod\n"] + new_lines
+
+    start_lineno, end_lineno = _find_func_lines_in_file(content, func_name, class_name)
 
     if start_lineno is not None:
-        # Replace exactly the lines the AST says belong to the old method
         updated = file_lines[: start_lineno - 1] + new_lines + file_lines[end_lineno:]
+    elif is_module:
+        # New module-level function — append at end of file
+        updated = file_lines + ["\n"] + new_lines
     else:
-        # New method — append inside the class body before it ends.
-        updated = _insert_into_class(file_lines, target_class.__name__, new_lines, class_indent)
+        updated = _insert_into_class(file_lines, class_name, new_lines, class_indent)
 
     with open(source_file, "w") as fh:
         fh.writelines(updated)

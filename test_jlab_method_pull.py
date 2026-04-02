@@ -8,7 +8,7 @@ import pytest
 from jlab_method_pull import (
     _all_module_level_names,
     _extract_file_imports,
-    _find_method_lines_in_file,
+    _find_func_lines_in_file,
     injectMethod,
     pullMethodCode,
 )
@@ -29,11 +29,28 @@ def write_module(tmp_path: Path, name: str, source: str) -> Path:
     return path
 
 
+def capture_cell(func, *args, **kwargs):
+    """Call func(*args, **kwargs) with get_ipython patched; return the cell text."""
+    import builtins
+    captured = {}
+
+    class FakeIP:
+        def set_next_input(self, text, replace=False):
+            captured["text"] = text
+
+    builtins.get_ipython = lambda: FakeIP()
+    try:
+        func(*args, **kwargs)
+    finally:
+        del builtins.get_ipython
+    return captured.get("text", "")
+
+
 # ---------------------------------------------------------------------------
-# _find_method_lines_in_file
+# _find_func_lines_in_file — class methods
 # ---------------------------------------------------------------------------
 
-class TestFindMethodLines:
+class TestFindFuncLines:
     SOURCE = textwrap.dedent("""\
         class Foo:
             def bar(self):
@@ -42,25 +59,48 @@ class TestFindMethodLines:
             def baz(self):
                 x = 2
                 return x
+
+        def standalone():
+            return 42
     """)
 
     def test_finds_first_method(self):
-        start, end = _find_method_lines_in_file(self.SOURCE, "Foo", "bar")
+        start, end = _find_func_lines_in_file(self.SOURCE, "bar", "Foo")
         assert start == 2
         assert end == 3
 
     def test_finds_second_method(self):
-        start, end = _find_method_lines_in_file(self.SOURCE, "Foo", "baz")
+        start, end = _find_func_lines_in_file(self.SOURCE, "baz", "Foo")
         assert start == 5
         assert end == 7
 
     def test_missing_method_returns_none(self):
-        start, end = _find_method_lines_in_file(self.SOURCE, "Foo", "nonexistent")
+        start, end = _find_func_lines_in_file(self.SOURCE, "nonexistent", "Foo")
         assert start is None and end is None
 
     def test_missing_class_returns_none(self):
-        start, end = _find_method_lines_in_file(self.SOURCE, "Bar", "bar")
+        start, end = _find_func_lines_in_file(self.SOURCE, "bar", "Bar")
         assert start is None and end is None
+
+    def test_finds_module_level_function(self):
+        start, end = _find_func_lines_in_file(self.SOURCE, "standalone")
+        assert start == 9
+        assert end == 10
+
+    def test_module_level_missing_returns_none(self):
+        start, end = _find_func_lines_in_file(self.SOURCE, "nowhere")
+        assert start is None and end is None
+
+    def test_includes_decorator_in_start(self):
+        source = textwrap.dedent("""\
+            class Foo:
+                @staticmethod
+                def bar(x):
+                    return x
+        """)
+        start, end = _find_func_lines_in_file(source, "bar", "Foo")
+        assert start == 2  # @staticmethod line
+        assert end == 4
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +149,7 @@ class TestAllModuleLevelNames:
 
 
 # ---------------------------------------------------------------------------
-# injectMethod — in-memory
+# injectMethod — in-memory, class
 # ---------------------------------------------------------------------------
 
 class TestInjectMethodInMemory:
@@ -136,7 +176,26 @@ class TestInjectMethodInMemory:
 
 
 # ---------------------------------------------------------------------------
-# injectMethod — persistent (rewrites source file)
+# injectMethod — in-memory, module
+# ---------------------------------------------------------------------------
+
+class TestInjectMethodModuleInMemory:
+    def test_replaces_module_function(self, tmp_path):
+        write_module(tmp_path, "mmod_mem", """\
+            def greet():
+                return "hello"
+        """)
+        import mmod_mem
+
+        def greet():
+            return "hi"
+
+        injectMethod(greet, mmod_mem, persistent=False)
+        assert mmod_mem.greet() == "hi"
+
+
+# ---------------------------------------------------------------------------
+# injectMethod — persistent, class
 # ---------------------------------------------------------------------------
 
 class TestInjectMethodPersistent:
@@ -154,10 +213,7 @@ class TestInjectMethodPersistent:
 
         injectMethod(double, Calc, persistent=True)
 
-        # Check in-memory behaviour
         assert Calc().double(4) == 12
-
-        # Check the file was rewritten
         new_source = mod.read_text()
         assert "x * 3" in new_source
         assert "x * 2" not in new_source
@@ -189,13 +245,11 @@ class TestInjectMethodPersistent:
 
         from pmod3 import Box  # noqa
 
-        # First patch in-memory only
         def label(self):
             return "v2"
 
         injectMethod(label, Box, persistent=False)
 
-        # Now persist a further change — must still find the right lines in file
         def label(self):  # noqa: F811
             return "v3"
 
@@ -208,27 +262,102 @@ class TestInjectMethodPersistent:
 
 
 # ---------------------------------------------------------------------------
+# injectMethod — persistent, module
+# ---------------------------------------------------------------------------
+
+class TestInjectMethodStaticMethod:
+    def test_in_memory_preserves_static(self):
+        class Target:
+            @staticmethod
+            def compute(x):
+                return x + 1
+
+        def compute(x):
+            return x + 10
+
+        injectMethod(compute, Target, persistent=False)
+        assert Target.compute(5) == 15
+        assert isinstance(Target.__dict__["compute"], staticmethod)
+
+    def test_persistent_rewrites_file_with_decorator(self, tmp_path):
+        mod = write_module(tmp_path, "smod", """\
+            class Calc:
+                @staticmethod
+                def double(x):
+                    return x * 2
+        """)
+
+        from smod import Calc  # noqa
+
+        def double(x):
+            return x * 3
+
+        injectMethod(double, Calc, persistent=True)
+
+        assert Calc.double(4) == 12
+        assert isinstance(Calc.__dict__["double"], staticmethod)
+        new_source = mod.read_text()
+        assert "@staticmethod" in new_source
+        assert "x * 3" in new_source
+        assert "x * 2" not in new_source
+
+    def test_pullMethodCode_strips_decorator(self, tmp_path):
+        write_module(tmp_path, "smod2", """\
+            class Tool:
+                @staticmethod
+                def run(x):
+                    return x
+        """)
+
+        from smod2 import Tool  # noqa
+
+        cell = capture_cell(pullMethodCode, Tool.run)
+        assert "@staticmethod" not in cell
+        assert "def run" in cell
+        assert "injectMethod(run, Tool" in cell
+
+
+class TestInjectMethodModulePersistent:
+    def test_replaces_function_in_file(self, tmp_path):
+        mod = write_module(tmp_path, "mmod", """\
+            def compute(x):
+                return x + 1
+        """)
+        import mmod
+
+        def compute(x):
+            return x + 10
+
+        injectMethod(compute, mmod, persistent=True)
+
+        assert mmod.compute(5) == 15
+        new_source = mod.read_text()
+        assert "x + 10" in new_source
+        assert "x + 1\n" not in new_source
+
+    def test_adds_new_function_to_file(self, tmp_path):
+        mod = write_module(tmp_path, "mmod2", """\
+            def existing():
+                return 0
+        """)
+        import mmod2
+
+        def new_func():
+            return 99
+
+        injectMethod(new_func, mmod2, persistent=True)
+
+        assert mmod2.new_func() == 99
+        assert "def new_func" in mod.read_text()
+
+
+# ---------------------------------------------------------------------------
 # pullMethodCode — cell content
 # ---------------------------------------------------------------------------
 
 class TestPullMethodCode:
-    def test_contains_dedented_def(self, tmp_path):
+    def test_method_cell_content(self, tmp_path):
         write_module(tmp_path, "cmod", """\
-            class Animal:
-                def speak(self):
-                    return "roar"
-        """)
-
-        from cmod import Animal  # noqa
-
-        result = pullMethodCode(Animal.speak)
-        assert result is None or isinstance(result, str)
-        # Function returns None (cell injection path) but we can test the
-        # cell content indirectly via the helper that builds it
-
-    def test_imports_included(self, tmp_path):
-        """The generated cell must include the file's imports."""
-        write_module(tmp_path, "cmod2", """\
             import os
 
             class Thing:
@@ -236,23 +365,24 @@ class TestPullMethodCode:
                     return os.getcwd()
         """)
 
-        from cmod2 import Thing  # noqa
+        from cmod import Thing  # noqa
 
-        # Patch get_ipython to capture the cell content
-        captured = {}
-
-        class FakeIP:
-            def set_next_input(self, text, replace=False):
-                captured["text"] = text
-
-        import builtins
-        builtins.get_ipython = lambda: FakeIP()
-        try:
-            pullMethodCode(Thing.name)
-        finally:
-            del builtins.get_ipython
-
-        cell = captured["text"]
+        cell = capture_cell(pullMethodCode, Thing.name)
         assert "import os" in cell
         assert "def name" in cell
         assert "injectMethod(name, Thing" in cell
+
+    def test_module_function_cell_content(self, tmp_path):
+        write_module(tmp_path, "cmod3", """\
+            import os
+
+            def get_path():
+                return os.getcwd()
+        """)
+        import cmod3  # noqa
+
+        cell = capture_cell(pullMethodCode, cmod3.get_path)
+        assert "import os" in cell
+        assert "import cmod3" in cell
+        assert "def get_path" in cell
+        assert "injectMethod(get_path, cmod3" in cell
