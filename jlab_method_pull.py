@@ -6,11 +6,14 @@ from pathlib import Path
 
 
 def install():
-    """Copy method_tools.py to the IPython startup directory.
+    """Copy jlab_method_pull.py to the IPython startup directory.
 
     Files in that directory are executed automatically at the start of every
     IPython/JupyterLab kernel, making pullMethodCode and injectMethod
     available without any explicit import.
+
+    If other startup files already define pullMethodCode or injectMethod,
+    the user is offered the choice to delete or disable each one.
     """
     try:
         from IPython.paths import get_ipython_dir
@@ -21,9 +24,65 @@ def install():
     startup_dir.mkdir(parents=True, exist_ok=True)
     src = Path(__file__).resolve()
     dst = startup_dir / src.name
+
+    _resolve_conflicts(startup_dir, skip=dst)
+
     shutil.copy2(src, dst)
     print(f"Installed to {dst}")
-    print("method_tools will be available in every new JupyterLab kernel automatically.")
+    print("pullMethodCode and injectMethod will be available in every new JupyterLab kernel.")
+
+
+def _defines_our_functions(path: Path) -> list[str]:
+    """Return which of pullMethodCode / injectMethod are defined in path."""
+    try:
+        tree = ast.parse(path.read_text())
+    except SyntaxError:
+        return []
+    names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    return [n for n in ("pullMethodCode", "injectMethod") if n in names]
+
+
+def _resolve_conflicts(startup_dir: Path, skip: Path):
+    """Check every .py file in startup_dir for conflicting definitions."""
+    conflicts = {
+        p: found
+        for p in sorted(startup_dir.glob("*.py"))
+        if p != skip and (found := _defines_our_functions(p))
+    }
+
+    if not conflicts:
+        return
+
+    print("\nThe following startup files already define conflicting functions:")
+    for path, names in conflicts.items():
+        print(f"  {path.name}  ({', '.join(names)})")
+
+    print("\nFor each file, choose an action:")
+    print("  d = delete the file")
+    print("  x = disable it (rename to .py.disabled)")
+    print("  s = skip (keep as-is)")
+
+    for path, names in conflicts.items():
+        while True:
+            choice = input(f"\n  [{path.name}] d / x / s? ").strip().lower()
+            if choice == "d":
+                path.unlink()
+                print(f"  Deleted {path.name}")
+                break
+            elif choice == "x":
+                disabled = path.with_suffix(".py.disabled")
+                path.rename(disabled)
+                print(f"  Disabled → {disabled.name}")
+                break
+            elif choice == "s":
+                print(f"  Kept {path.name}")
+                break
+            else:
+                print("  Please enter d, x, or s.")
 
 
 def pullMethodCode(class_method) -> str:
