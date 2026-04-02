@@ -2,16 +2,23 @@ import importlib
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def auto_confirm(monkeypatch):
+    """Auto-answer 'y' to the diff confirmation prompt in all tests."""
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+
 from jlab_method_pull import (
-    _all_module_level_names,
-    _extract_file_imports,
-    _find_func_lines_in_file,
+    _find_func_lines,
+    _public_names,
     injectMethod,
     pullMethodCode,
 )
+import ast
 
 
 # ---------------------------------------------------------------------------
@@ -65,30 +72,30 @@ class TestFindFuncLines:
     """)
 
     def test_finds_first_method(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "bar", "Foo")
+        start, end = _find_func_lines(self.SOURCE, "bar", "Foo")
         assert start == 2
         assert end == 3
 
     def test_finds_second_method(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "baz", "Foo")
+        start, end = _find_func_lines(self.SOURCE, "baz", "Foo")
         assert start == 5
         assert end == 7
 
     def test_missing_method_returns_none(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "nonexistent", "Foo")
+        start, end = _find_func_lines(self.SOURCE, "nonexistent", "Foo")
         assert start is None and end is None
 
     def test_missing_class_returns_none(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "bar", "Bar")
+        start, end = _find_func_lines(self.SOURCE, "bar", "Bar")
         assert start is None and end is None
 
     def test_finds_module_level_function(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "standalone")
+        start, end = _find_func_lines(self.SOURCE, "standalone")
         assert start == 9
         assert end == 10
 
     def test_module_level_missing_returns_none(self):
-        start, end = _find_func_lines_in_file(self.SOURCE, "nowhere")
+        start, end = _find_func_lines(self.SOURCE, "nowhere")
         assert start is None and end is None
 
     def test_includes_decorator_in_start(self):
@@ -98,52 +105,25 @@ class TestFindFuncLines:
                 def bar(x):
                     return x
         """)
-        start, end = _find_func_lines_in_file(source, "bar", "Foo")
+        start, end = _find_func_lines(source, "bar", "Foo")
         assert start == 2  # @staticmethod line
         assert end == 4
 
 
 # ---------------------------------------------------------------------------
-# _extract_file_imports
+# _public_names
 # ---------------------------------------------------------------------------
 
-class TestExtractFileImports:
-    def test_extracts_imports(self, tmp_path):
-        p = tmp_path / "mod.py"
-        p.write_text("import os\nimport sys\n\nclass Foo:\n    pass\n")
-        result = _extract_file_imports(str(p))
-        assert "import os" in result
-        assert "import sys" in result
-
-    def test_no_imports(self, tmp_path):
-        p = tmp_path / "mod.py"
-        p.write_text("class Foo:\n    pass\n")
-        assert _extract_file_imports(str(p)) == ""
-
-    def test_from_import(self, tmp_path):
-        p = tmp_path / "mod.py"
-        p.write_text("from pathlib import Path\n")
-        result = _extract_file_imports(str(p))
-        assert "pathlib" in result
-        assert "Path" in result
-
-
-# ---------------------------------------------------------------------------
-# _all_module_level_names
-# ---------------------------------------------------------------------------
-
-class TestAllModuleLevelNames:
-    def test_returns_classes_and_functions(self, tmp_path):
-        p = tmp_path / "mod.py"
-        p.write_text("class Foo:\n    pass\n\ndef bar():\n    pass\n")
-        names = _all_module_level_names(str(p))
+class TestPublicNames:
+    def test_returns_classes_and_functions(self):
+        tree = ast.parse("class Foo:\n    pass\n\ndef bar():\n    pass\n")
+        names = _public_names(tree)
         assert "Foo" in names
         assert "bar" in names
 
-    def test_excludes_imports(self, tmp_path):
-        p = tmp_path / "mod.py"
-        p.write_text("import os\nclass Foo:\n    pass\n")
-        names = _all_module_level_names(str(p))
+    def test_excludes_imports(self):
+        tree = ast.parse("import os\nclass Foo:\n    pass\n")
+        names = _public_names(tree)
         assert "os" not in names
         assert "Foo" in names
 

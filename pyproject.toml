@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jlab_method_pull"
-version = "1.0.0"
+version = "1.1.0"
 description = "Pull class methods into Jupyter cells and inject edited versions back — with optional persistence to source files"
 readme = "README.md"
 license = "MIT"
