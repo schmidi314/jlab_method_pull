@@ -1,13 +1,13 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "jlab_method_pull"
-version = "0.1.0"
+version = "1.0.0"
 description = "Pull class methods into Jupyter cells and inject edited versions back — with optional persistence to source files"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.9"
 dependencies = []
 
